@@ -1,41 +1,157 @@
 #![feature(total_cmp)]
-use std::collections::hash_map::Entry;
-use std::iter::once;
-use std::ops::Sub;
+use std::time::Instant;
 
 use itertools::Itertools;
 use nannou::color::Alpha;
-use nannou::prelude::*;
+use nannou::event::Key;
+use nannou::prelude::{
+    gray, pt2, random, vec2, App, Draw, Frame, MouseButton, Point2, Rect, Rgb, Srgb, Update, Vec2,
+    WindowEvent,
+};
 use nannou::rand::prelude::{IteratorRandom, SliceRandom};
 use nannou::rand::thread_rng;
-use petgraph::data::Build;
-use petgraph::graph::Node;
+use nannou_egui::egui::Slider;
+use nannou_egui::{egui, Egui};
 use petgraph::visit::{EdgeRef, IntoEdgeReferences, IntoNodeReferences};
-use petgraph::{Directed, Direction, Undirected};
-use spade::{DelaunayTriangulation, HasPosition, Triangulation};
-use Direction::Outgoing;
+
+use delaunay_stabilization::*;
 
 fn main() {
-    nannou::app(model)
-        .update(update)
-        .simple_window(view)
-        .event(event)
-        .run();
+    nannou::app(|app| {
+        let window_id = app
+            .new_window()
+            .title("Nannou + Egui")
+            .raw_event(|_, model: &mut Model, event| model.egui.handle_raw_event(event))
+            .event(event)
+            .view(view)
+            .build()
+            .unwrap();
+
+        let window = app.window(window_id).unwrap();
+
+        Model {
+            egui: Egui::from_window(&window),
+            graph: Default::default(),
+            steps: 0,
+            last_check: Instant::now(),
+            is_connected: true,
+            update_speed: 500,
+        }
+    })
+    .update(update)
+    .run();
 }
-
-type HashMap<K, V> = rustc_hash::FxHashMap<K, V>;
-type HashSet<K> = rustc_hash::FxHashSet<K>;
-
-type Graph = petgraph::stable_graph::StableGraph<Point2, EdgeKind, Directed>;
-type LocalDelaunayGraph = petgraph::stable_graph::StableGraph<NodeIndex, (), Undirected, u16>;
-type NodeIndex = petgraph::graph::NodeIndex<u32>;
-type LDNodeIndex = petgraph::graph::NodeIndex<u16>;
 
 struct Model {
+    egui: Egui,
     graph: Graph,
+    steps: usize,
+    last_check: Instant,
+    update_speed: u32,
+    is_connected: bool,
 }
 
-fn model(app: &App) -> Model {
+fn update(
+    _app: &App,
+    Model {
+        egui,
+        graph,
+        steps,
+        last_check,
+        is_connected,
+        update_speed,
+    }: &mut Model,
+    update: Update,
+) {
+    egui.set_elapsed_time(update.since_start);
+    let ctx = egui.begin_frame();
+    egui::Window::new("")
+        .default_size(egui::vec2(0.0, 200.0))
+        .show(&ctx, |ui| {
+            ui.label("Left click to add node");
+            ui.label("Right click to remove node");
+            ui.label("Press R to regenerate a random graph");
+            ui.label("Press U to trigger a step manually");
+            ui.add_space(10.0);
+            ui.label(format!("Current step: {}", steps));
+            ui.add(
+                Slider::new(update_speed, 1..=1000)
+                    .prefix("Update delay: ")
+                    .suffix(" ms"),
+            );
+            if !*is_connected {
+                ui.label("UNCONNECTED TOPOLOGY!");
+            }
+        });
+
+    if last_check.elapsed().as_millis() < *update_speed as _ {
+        return;
+    }
+    *last_check = Instant::now();
+
+    let old = graph.clone();
+    let old = old
+        .edge_references()
+        .sorted_by_key(|a| (a.source(), a.target()));
+    delaunay_update(graph);
+    let new = graph
+        .edge_references()
+        .sorted_by_key(|a| (a.source(), a.target()));
+    if !new.eq(old) {
+        *steps += 1;
+    }
+}
+
+fn event(app: &App, model: &mut Model, event: WindowEvent) {
+    match event {
+        WindowEvent::KeyReleased(Key::R) => {
+            (model.graph, model.is_connected) = create_graph();
+            model.steps = 0
+        }
+        WindowEvent::KeyPressed(Key::U) => {
+            delaunay_update(&mut model.graph);
+            model.steps += 1
+        }
+        WindowEvent::MousePressed(MouseButton::Left) if !model.egui.ctx().wants_pointer_input() => {
+            let rect = app.main_window().rect();
+            let connection = model.graph.node_indices().choose(&mut thread_rng());
+            let idx = model
+                .graph
+                .add_node(Vec2::new(app.mouse.x, app.mouse.y) / Vec2::new(rect.w(), rect.h()));
+            let connection = match connection {
+                Some(it) => it,
+                None => return,
+            };
+            model.graph.add_edge(idx, connection, EdgeKind::Temp);
+            model.graph.add_edge(connection, idx, EdgeKind::Temp);
+            model.steps = 0;
+            model.last_check = Instant::now();
+        }
+        WindowEvent::MousePressed(MouseButton::Right)
+            if !model.egui.ctx().wants_pointer_input() =>
+        {
+            let rect = app.main_window().rect();
+            let cursor = Vec2::new(app.mouse.x, app.mouse.y) / Vec2::new(rect.w(), rect.h());
+            if let Some((node, _)) =
+                model
+                    .graph
+                    .node_references()
+                    .min_by(|&(_, &pos), &(_, &pos2)| {
+                        (cursor - pos)
+                            .length_squared()
+                            .total_cmp(&(cursor - pos2).length_squared())
+                    })
+            {
+                model.graph.remove_node(node);
+                model.steps = 0;
+                model.last_check = Instant::now();
+            }
+        }
+        _ => (),
+    }
+}
+
+fn create_graph() -> (Graph, bool) {
     let mut graph = Graph::new();
     // TODO: doesn't check for degeneracy
     let nodes: Vec<_> = (0..50)
@@ -61,257 +177,20 @@ fn model(app: &App) -> Model {
     let edges = edges.choose_multiple(&mut thread_rng(), edges_to_retain);
     graph.extend_with_edges(edges);
 
-    if let components @ [_, _, ..] = petgraph::algo::tarjan_scc(&graph).as_slice() {
-        println!("Unconnected components! Fixing up...");
-        components.windows(2).for_each(|window| {
-            let a = &window[0];
-            let b = &window[1];
-            let &a = a.choose(&mut thread_rng()).unwrap();
-            let &b = b.choose(&mut thread_rng()).unwrap();
-            graph.add_edge(a, b, EdgeKind::Temp);
-            graph.add_edge(b, a, EdgeKind::Temp);
-        });
+    if let _components @ [_, _, ..] = petgraph::algo::tarjan_scc(&graph).as_slice() {
+        // println!("Unconnected components! Fixing up...");
+        // components.windows(2).for_each(|window| {
+        //     let a = &window[0];
+        //     let b = &window[1];
+        //     let &a = a.choose(&mut thread_rng()).unwrap();
+        //     let &b = b.choose(&mut thread_rng()).unwrap();
+        //     graph.add_edge(a, b, EdgeKind::Temp);
+        //     graph.add_edge(b, a, EdgeKind::Temp);
+        // });
+        (graph, false)
+    } else {
+        (graph, true)
     }
-
-    // validate
-
-    dbg!(graph.node_count());
-    dbg!(graph.edge_count());
-    Model { graph }
-}
-
-fn update(_app: &App, _model: &mut Model, _update: Update) {}
-
-fn event(app: &App, _model: &mut Model, event: Event) {
-    match event {
-        Event::WindowEvent {
-            simple: Some(WindowEvent::KeyReleased(Key::R)),
-            ..
-        } => *_model = model(app),
-        Event::WindowEvent {
-            simple: Some(WindowEvent::KeyPressed(Key::U)),
-            ..
-        } => delaunay_update(&mut _model.graph),
-        Event::WindowEvent {
-            simple: Some(WindowEvent::MousePressed(MouseButton::Left)),
-            ..
-        } => {
-            let rect = app.main_window().rect();
-            let connection = _model.graph.node_indices().choose(&mut thread_rng());
-            let idx = _model
-                .graph
-                .add_node(Vec2::new(app.mouse.x, app.mouse.y) / Vec2::new(rect.w(), rect.h()));
-            let connection = match connection {
-                Some(it) => it,
-                None => return,
-            };
-            _model.graph.add_edge(idx, connection, EdgeKind::Temp);
-            _model.graph.add_edge(connection, idx, EdgeKind::Temp);
-        }
-        Event::WindowEvent {
-            simple: Some(WindowEvent::MousePressed(MouseButton::Right)),
-            ..
-        } => {
-            let rect = app.main_window().rect();
-            let cursor = Vec2::new(app.mouse.x, app.mouse.y) / Vec2::new(rect.w(), rect.h());
-            if let Some((node, _)) =
-                _model
-                    .graph
-                    .node_references()
-                    .min_by(|&(_, &pos), &(_, &pos2)| {
-                        (cursor - pos)
-                            .length_squared()
-                            .total_cmp(&(cursor - pos2).length_squared())
-                    })
-            {
-                _model.graph.remove_node(node);
-            }
-        }
-        _ => (),
-    }
-}
-
-fn local_delaunay(g: &Graph, u: NodeIndex) -> (LocalDelaunayGraph, LDNodeIndex) {
-    let mut graph = LocalDelaunayGraph::default();
-    let ldg_u = graph.add_node(u);
-
-    let nodes: Vec<_> = g
-        .neighbors_directed(u, Outgoing)
-        .map(|id| (g[id], graph.add_node(id)))
-        .chain(Some((g[u], ldg_u)))
-        .collect();
-    {
-        struct DPoint(spade::Point2<f32>, LDNodeIndex);
-
-        impl HasPosition for DPoint {
-            type Scalar = f32;
-
-            fn position(&self) -> spade::Point2<Self::Scalar> {
-                self.0
-            }
-        }
-
-        let mut triangulation = DelaunayTriangulation::<DPoint>::new();
-
-        nodes.iter().for_each(|&(pos, idx)| {
-            triangulation
-                .insert(DPoint(spade::Point2::new(pos[0], pos[1]), idx))
-                .unwrap();
-        });
-
-        graph.extend_with_edges(triangulation.undirected_edges().map(|it| {
-            (
-                it.as_directed().from().data().1,
-                it.as_directed().to().data().1,
-            )
-        }));
-    }
-
-    (graph, ldg_u)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum EdgeKind {
-    Stable1,
-    Stable2,
-    Temp,
-}
-
-/// Advance the graph by one delaunay update step.
-fn delaunay_update(g: &mut Graph) {
-    let mut edges = HashMap::<_, EdgeKind>::default();
-    g.node_indices()
-        .flat_map(|u| select_edges(g, u))
-        .for_each(|(edge, ty)| match edges.entry(edge) {
-            Entry::Occupied(mut slot) => match (slot.get_mut(), ty) {
-                (_, EdgeKind::Temp) | (EdgeKind::Stable1, _) => {}
-                (kind, new) => *kind = new,
-            },
-            Entry::Vacant(slot) => drop(slot.insert(ty)),
-        });
-
-    g.clear_edges();
-    g.extend_with_edges(edges.into_iter().map(|((s, d), v)| (s, d, v)));
-}
-
-/// Select the update edges for given node in the graph.
-fn select_edges(g: &Graph, u: NodeIndex) -> HashMap<(NodeIndex, NodeIndex), EdgeKind> {
-    // Generate the local delaunay graph of the node.
-    let (ldg, u_in_ldg) = local_delaunay(g, u);
-
-    // Generate the stable edges.
-    let mut edges = stable_edges(g, &ldg, u_in_ldg);
-    // Generate the temporal edges and merge the edge sets.
-    for (edge, ty) in temp_edges(g, &ldg, u_in_ldg) {
-        if !edges.contains_key(&edge) {
-            edges.insert(edge, ty);
-        }
-    }
-    edges
-}
-
-/// Select the stable edges.
-fn stable_edges(
-    g: &Graph,
-    local_delaunay: &LocalDelaunayGraph,
-    u: LDNodeIndex,
-) -> HashMap<(NodeIndex, NodeIndex), EdgeKind> {
-    let make_undirected = |(v, w)| [(v, w), (w, v)];
-    // Select edges from u to its neighbors in the local delaunay graph.
-    // { {u, v} : v ∈ NGL(G,u)(u) }
-    let u_to_neighbors = local_delaunay
-        .neighbors_directed(u, Outgoing)
-        .zip(once(u).cycle())
-        .flat_map(make_undirected);
-
-    let u_p = g[local_delaunay[u]];
-    // Select circular edges between u's neighbors
-    let circular_neighbors = local_delaunay
-        .neighbors_directed(u, Outgoing)
-        .map(|v| {
-            let v = local_delaunay[v];
-            let v_p = g[v] - u_p;
-            (v, v_p.y.atan2(v_p.x) + PI)
-        })
-        .sorted_by(|(_, a), (_, b)| a.total_cmp(b))
-        .circular_tuple_windows::<(_, _)>()
-        .filter(|((a, _), (b, _))| a != b) // circular of 1 will add an (a, a) pair which creates a circular edge!
-        // (a < b)
-        .filter(|((av, a), (bv, b))| {
-            let d = b.sub(a);
-            d < -PI || (0.0 < d && d < PI)
-        })
-        .flat_map(|((v, _), (w, _))| [(v, w), (w, v)]);
-    // let circular_between_neighbors = neighbors_directed
-    //     .tuple_combinations::<(_, _)>()
-    //     .filter(|&(v, w)| {
-    //         // ∠vuw
-    //         let v = g[local_delaunay[v]];
-    //         let w = g[local_delaunay[w]];
-    //         let vu = v - g[local_delaunay[u]];
-    //         let wu = w - g[local_delaunay[u]];
-    //         let cross2d = |a: Vec2, b: Vec2| a[0] * b[1] - a[1] * b[0];
-
-    //         !local_delaunay.neighbors_directed(u, Outgoing).any(|x| {
-    //             let x = g[local_delaunay[x]] - g[local_delaunay[u]];
-    //             cross2d(vu, x) > 0.0 && cross2d(x, wu) > 0.0
-    //                 || cross2d(vu, x) < 0.0 && cross2d(x, wu) < 0.0
-    //         })
-    //     })
-    //     .flat_map(make_undirected);
-
-    let mut edges = HashMap::default();
-
-    // Make the edges undirected and map the indices into g accordingly.
-
-    let map_graph_index_pair = |(v, w)| (local_delaunay[v], local_delaunay[w]);
-
-    edges.extend(
-        u_to_neighbors
-            .map(map_graph_index_pair)
-            .map(|it| (it, EdgeKind::Stable1)),
-    );
-    edges.extend(
-        circular_neighbors
-            // circular_between_neighbors
-            //     .map(map_graph_index_pair)
-            .map(|it| (it, EdgeKind::Stable2)),
-    );
-
-    edges
-}
-
-/// Select the temporal edges.
-fn temp_edges(
-    g: &Graph,
-    local_delaunay: &LocalDelaunayGraph,
-    u: LDNodeIndex,
-) -> HashMap<(NodeIndex, NodeIndex), EdgeKind> {
-    let vs = local_delaunay
-        .neighbors_directed(u, Outgoing)
-        .map(|v| local_delaunay[v]);
-    let ws = {
-        let mut ws: HashSet<_> = g.neighbors_directed(local_delaunay[u], Outgoing).collect();
-        ws.remove(&local_delaunay[u]);
-        vs.clone().for_each(|v| drop(ws.remove(&v)));
-        ws
-    };
-
-    vs.clone()
-        .flat_map(|v| ws.iter().map(move |&w| (v, w)))
-        .filter(|&(v, w)| {
-            let v = g[v];
-            let w = g[w];
-
-            let vw_length = (v - w).length();
-
-            vs.clone().all(|x| {
-                let x = g[x];
-                (x - w).length() >= vw_length
-            })
-        })
-        .map(|it| (it, EdgeKind::Temp))
-        .collect()
 }
 
 fn view(app: &App, model: &Model, frame: Frame) {
@@ -337,44 +216,6 @@ fn view(app: &App, model: &Model, frame: Frame) {
         stable2_color,
     );
 
-    // let mut x = Graph::new();
-    // let delaun = local_delaunay(&model.graph, NodeIndex::new(0));
-    // let xa: Vec<_> = delaun
-    //     .node_references()
-    //     .map(|n| (n.0, x.add_node(model.graph[*n.1])))
-    //     .collect();
-    // delaun.edge_references().for_each(|e| {
-    //     x.add_edge(
-    //         xa.iter().find(|&&(it, _)| it == e.source()).unwrap().1,
-    //         xa.iter().find(|&&(it, _)| it == e.target()).unwrap().1,
-    //         EdgeKind::Temp,
-    //     );
-    // });
-    // render_graph(
-    //     &draw,
-    //     &(win.pad_top(-100.0)),
-    //     &x,
-    //     Srgb::new(1.0, 0.0, 1.0),
-    //     Srgb::new(1.0, 0.0, 1.0),
-    //     Srgb::new(1.0, 0.0, 1.0),
-    // );
-
-    // let first = model.graph[NodeIndex::new(0)];
-    // draw.ellipse()
-    //     .x_y((first.x - 0.5) * win.w(), (first.y - 0.5) * win.h())
-    //     .w_h(10.0, 10.0)
-    //     .rgba(0.0, 0.0, 0.0, 1.0);
-    // model
-    //     .graph
-    //     .neighbors_directed(NodeIndex::new(0), Outgoing)
-    //     .for_each(|id| {
-    //         let node = model.graph[id];
-    //         draw.ellipse()
-    //             .x_y((node.x - 0.5) * win.w(), (node.y - 0.5) * win.h())
-    //             .w_h(10.0, 10.0)
-    //             .rgba(0.0, 0.0, 1.0, 1.0);
-    //     });
-
     // Crosshair.
     let crosshair_color = gray(0.5);
 
@@ -390,9 +231,11 @@ fn view(app: &App, model: &Model, frame: Frame) {
     draw.text(&pos)
         .xy(mouse + vec2(0.0, 20.0))
         .font_size(14)
-        .color(WHITE);
+        .color(Rgb::new(0.0, 0.0, 0.0));
 
     draw.to_frame(app, &frame).unwrap();
+
+    let _ = model.egui.draw_to_frame(&frame);
 }
 
 fn render_graph(draw: &Draw, rect: &Rect, graph: &Graph, temp: Srgb, stable: Srgb, stable2: Srgb) {
