@@ -33,7 +33,7 @@ fn main() {
             egui: Egui::from_window(&window),
             graph: Default::default(),
             steps: 0,
-            last_check: Instant::now(),
+            last_check: Some(Instant::now()),
             is_connected: true,
             update_speed: 500,
         }
@@ -46,7 +46,7 @@ struct Model {
     egui: Egui,
     graph: Graph,
     steps: usize,
-    last_check: Instant,
+    last_check: Option<Instant>,
     update_speed: u32,
     is_connected: bool,
 }
@@ -74,20 +74,31 @@ fn update(
             ui.label("Press U to trigger a step manually");
             ui.add_space(10.0);
             ui.label(format!("Current step: {}", steps));
+            ui.label(format!("Num nodes: {}", graph.node_count()));
+            ui.label(format!("Num edges: {}", graph.edge_count()));
             ui.add(
                 Slider::new(update_speed, 1..=1000)
                     .prefix("Update delay: ")
                     .suffix(" ms"),
             );
+            let mut checked = last_check.is_some();
+            ui.checkbox(&mut checked, "auto-update");
+            match last_check {
+                Some(_) if !checked => *last_check = None,
+                None if checked => *last_check = Some(Instant::now()),
+                _ => (),
+            }
             if !*is_connected {
                 ui.label("UNCONNECTED TOPOLOGY!");
+                ui.label("Press C to connect via random edge");
             }
         });
-
-    if last_check.elapsed().as_millis() < *update_speed as _ {
-        return;
+    match last_check {
+        Some(last_check) if last_check.elapsed().as_millis() >= *update_speed as _ => {
+            *last_check = Instant::now();
+        }
+        _ => return,
     }
-    *last_check = Instant::now();
 
     let old = graph.clone();
     let old = old
@@ -112,6 +123,15 @@ fn event(app: &App, model: &mut Model, event: WindowEvent) {
             delaunay_update(&mut model.graph);
             model.steps += 1
         }
+        WindowEvent::KeyPressed(Key::C) => {
+            for window in petgraph::algo::tarjan_scc(&model.graph).windows(2) {
+                let a = &window[0];
+                let b = &window[1];
+                let &a = a.choose(&mut thread_rng()).unwrap();
+                let &b = b.choose(&mut thread_rng()).unwrap();
+                model.graph.add_edge(a, b, EdgeKind::Temp);
+            }
+        }
         WindowEvent::MousePressed(MouseButton::Left) if !model.egui.ctx().wants_pointer_input() => {
             let rect = app.main_window().rect();
             let connection = model.graph.node_indices().choose(&mut thread_rng());
@@ -125,7 +145,9 @@ fn event(app: &App, model: &mut Model, event: WindowEvent) {
             model.graph.add_edge(idx, connection, EdgeKind::Temp);
             model.graph.add_edge(connection, idx, EdgeKind::Temp);
             model.steps = 0;
-            model.last_check = Instant::now();
+            if let Some(last_check) = &mut model.last_check {
+                *last_check = Instant::now();
+            }
         }
         WindowEvent::MousePressed(MouseButton::Right)
             if !model.egui.ctx().wants_pointer_input() =>
@@ -144,7 +166,13 @@ fn event(app: &App, model: &mut Model, event: WindowEvent) {
             {
                 model.graph.remove_node(node);
                 model.steps = 0;
-                model.last_check = Instant::now();
+                if let Some(last_check) = &mut model.last_check {
+                    *last_check = Instant::now();
+                }
+                model.is_connected = !matches!(
+                    petgraph::algo::tarjan_scc(&model.graph).as_slice(),
+                    [_, _, ..]
+                );
             }
         }
         _ => (),
@@ -177,20 +205,8 @@ fn create_graph() -> (Graph, bool) {
     let edges = edges.choose_multiple(&mut thread_rng(), edges_to_retain);
     graph.extend_with_edges(edges);
 
-    if let _components @ [_, _, ..] = petgraph::algo::tarjan_scc(&graph).as_slice() {
-        // println!("Unconnected components! Fixing up...");
-        // components.windows(2).for_each(|window| {
-        //     let a = &window[0];
-        //     let b = &window[1];
-        //     let &a = a.choose(&mut thread_rng()).unwrap();
-        //     let &b = b.choose(&mut thread_rng()).unwrap();
-        //     graph.add_edge(a, b, EdgeKind::Temp);
-        //     graph.add_edge(b, a, EdgeKind::Temp);
-        // });
-        (graph, false)
-    } else {
-        (graph, true)
-    }
+    let is_connected = !matches!(petgraph::algo::tarjan_scc(&graph).as_slice(), [_, _, ..]);
+    (graph, is_connected)
 }
 
 fn view(app: &App, model: &Model, frame: Frame) {
