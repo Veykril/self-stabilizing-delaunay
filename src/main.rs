@@ -36,6 +36,8 @@ fn main() {
             last_check: Some(Instant::now()),
             is_connected: true,
             update_speed: 500,
+            count_nodes: 50,
+            is_stable: false,
         }
     })
     .update(update)
@@ -49,6 +51,8 @@ struct Model {
     last_check: Option<Instant>,
     update_speed: u32,
     is_connected: bool,
+    count_nodes: usize,
+    is_stable: bool,
 }
 
 fn update(
@@ -60,6 +64,8 @@ fn update(
         last_check,
         is_connected,
         update_speed,
+        count_nodes,
+        is_stable,
     }: &mut Model,
     update: Update,
 ) {
@@ -71,9 +77,14 @@ fn update(
             ui.label("Left click to add node");
             ui.label("Right click to remove node");
             ui.label("Press R to regenerate a random graph");
+            ui.add(Slider::new(count_nodes, 1..=1000).prefix("Random graph node count: "));
             ui.label("Press U to trigger a step manually");
             ui.add_space(10.0);
-            ui.label(format!("Current step: {}", steps));
+            ui.label(format!(
+                "Current step: {}{}",
+                steps,
+                if *is_stable { " (stable)" } else { "" }
+            ));
             ui.label(format!("Num nodes: {}", graph.node_count()));
             ui.label(format!("Num edges: {}", graph.edge_count()));
             ui.add(
@@ -116,7 +127,7 @@ fn update(
 fn event(app: &App, model: &mut Model, event: WindowEvent) {
     match event {
         WindowEvent::KeyReleased(Key::R) => {
-            (model.graph, model.is_connected) = create_graph();
+            (model.graph, model.is_connected) = create_graph(model.count_nodes);
             model.steps = 0
         }
         WindowEvent::KeyPressed(Key::U) => {
@@ -179,10 +190,10 @@ fn event(app: &App, model: &mut Model, event: WindowEvent) {
     }
 }
 
-fn create_graph() -> (Graph, bool) {
+fn create_graph(num: usize) -> (Graph, bool) {
     let mut graph = Graph::new();
-    // TODO: doesn't check for degeneracy
-    let nodes: Vec<_> = (0..50)
+    // TODO: doesn't check for degeneracy!
+    let nodes: Vec<_> = (0..num)
         .map(|_| graph.add_node(Point2::new(random::<f32>() - 0.5, random::<f32>() - 0.5)))
         .collect();
 
@@ -211,8 +222,8 @@ fn create_graph() -> (Graph, bool) {
 
 fn view(app: &App, model: &Model, frame: Frame) {
     let temp_color: Srgb = Srgb::new(1.0, 0.0, 0.0);
-    let stable1_color: Srgb = Srgb::new(1.0, 1.0, 0.0);
-    let stable2_color: Srgb = Srgb::new(0.0, 0.0, 1.0);
+    let radial_color: Srgb = Srgb::new(1.0, 1.0, 0.0);
+    let circular_color: Srgb = Srgb::new(0.0, 0.0, 1.0);
 
     let draw = app.draw();
     let window = app.main_window();
@@ -228,8 +239,8 @@ fn view(app: &App, model: &Model, frame: Frame) {
         &win,
         &model.graph,
         temp_color,
-        stable1_color,
-        stable2_color,
+        radial_color,
+        circular_color,
     );
 
     // Crosshair.
@@ -254,7 +265,7 @@ fn view(app: &App, model: &Model, frame: Frame) {
     let _ = model.egui.draw_to_frame(&frame);
 }
 
-fn render_graph(draw: &Draw, rect: &Rect, graph: &Graph, temp: Srgb, stable: Srgb, stable2: Srgb) {
+fn render_graph(draw: &Draw, rect: &Rect, graph: &Graph, temp: Srgb, radial: Srgb, circular: Srgb) {
     graph.edge_references().for_each(|edge| {
         let source = edge.source();
         let target = edge.target();
@@ -270,8 +281,8 @@ fn render_graph(draw: &Draw, rect: &Rect, graph: &Graph, temp: Srgb, stable: Srg
             .color(Alpha {
                 alpha: 0.5f32,
                 color: match edge.weight() {
-                    EdgeKind::Stable1 => stable,
-                    EdgeKind::Stable2 => stable2,
+                    EdgeKind::Radial => radial,
+                    EdgeKind::Circular => circular,
                     EdgeKind::Temp => temp,
                 },
             });
@@ -279,7 +290,7 @@ fn render_graph(draw: &Draw, rect: &Rect, graph: &Graph, temp: Srgb, stable: Srg
     graph.node_indices().for_each(|node| {
         let pos = graph[node];
         let pos = Vec2::new(pos.x * rect.w(), pos.y * rect.h());
-        draw.ellipse().xy(pos).w_h(10.0, 10.0).color(stable);
+        draw.ellipse().xy(pos).w_h(10.0, 10.0).color(radial);
         draw.text(&format!("{}", node.index()))
             .xy(pos + Vec2::new(0.0, 20.0))
             .w_h(10.0, 10.0);
