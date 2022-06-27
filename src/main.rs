@@ -1,4 +1,4 @@
-#![feature(total_cmp)]
+use std::path::Path;
 use std::time::Instant;
 
 use itertools::Itertools;
@@ -10,7 +10,7 @@ use nannou::prelude::{
 };
 use nannou::rand::prelude::{IteratorRandom, SliceRandom};
 use nannou::rand::thread_rng;
-use nannou_egui::egui::Slider;
+use nannou_egui::egui::{DragValue, Slider};
 use nannou_egui::{egui, Egui};
 use petgraph::visit::{EdgeRef, IntoEdgeReferences, IntoNodeReferences};
 
@@ -24,20 +24,31 @@ fn main() {
             .raw_event(|_, model: &mut Model, event| model.egui.handle_raw_event(event))
             .event(event)
             .view(view)
+            .power_preference(nannou::wgpu::PowerPreference::LowPower)
             .build()
             .unwrap();
 
         let window = app.window(window_id).unwrap();
 
+        let path = "./graphs/default.json".into();
+        let mut graph = Default::default();
+
+        deserialize_graph(&mut graph, &path);
+
         Model {
             egui: Egui::from_window(&window),
-            graph: Default::default(),
+            graph,
             steps: 0,
             last_check: Some(Instant::now()),
             is_connected: true,
             update_speed: 500,
             count_nodes: 50,
             is_stable: false,
+            path,
+            preferred_edge: None,
+            temp_color: [255, 0, 0],
+            radial_color: [255, 255, 0],
+            circular_color: [0, 0, 255],
         }
     })
     .update(update)
@@ -53,6 +64,44 @@ struct Model {
     is_connected: bool,
     count_nodes: usize,
     is_stable: bool,
+    path: String,
+    preferred_edge: Option<u32>,
+    temp_color: [u8; 3],
+    radial_color: [u8; 3],
+    circular_color: [u8; 3],
+}
+
+fn deserialize_graph(graph: &mut Graph, path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(r) => match serde_json::from_reader(r) {
+            Err(e) => {
+                eprintln!("Failed to deserialize graph {e}");
+            }
+            Ok(g) => *graph = g,
+        },
+        Err(e) => {
+            eprintln!("Failed to open file {}: {e}", path.display());
+        }
+    }
+}
+fn serialize_graph(graph: &Graph, path: impl AsRef<Path>) {
+    let path = path.as_ref();
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+    {
+        Ok(w) => {
+            if let Err(e) = serde_json::to_writer(w, graph) {
+                eprintln!("Failed to serialize graph {e}");
+            }
+        }
+        Err(e) => {
+            eprintln!("Failed to open file {}: {e}", path.display());
+        }
+    }
 }
 
 fn update(
@@ -66,20 +115,62 @@ fn update(
         update_speed,
         count_nodes,
         is_stable,
+        path,
+        preferred_edge,
+        temp_color,
+        radial_color,
+        circular_color,
     }: &mut Model,
     update: Update,
 ) {
     egui.set_elapsed_time(update.since_start);
     let ctx = egui.begin_frame();
-    egui::Window::new("")
+    egui::Window::new("tools")
         .default_size(egui::vec2(0.0, 200.0))
         .show(&ctx, |ui| {
-            ui.label("Left click to add node");
-            ui.label("Right click to remove node");
-            ui.label("Press R to regenerate a random graph");
             ui.add(Slider::new(count_nodes, 1..=1000).prefix("Random graph node count: "));
-            ui.label("Press U to trigger a step manually");
             ui.add_space(10.0);
+            ui.add(
+                Slider::new(update_speed, 1..=1000)
+                    .prefix("Update delay: ")
+                    .suffix(" ms"),
+            );
+            let mut checked = last_check.is_some();
+            checked ^= ui.selectable_label(checked, "auto-update").clicked();
+            match last_check {
+                Some(_) if !checked => *last_check = None,
+                None if checked => *last_check = Some(Instant::now()),
+                _ => (),
+            }
+
+            let mut value = preferred_edge.map_or(-1, |it| it as i32);
+            ui.add(
+                DragValue::new(&mut value)
+                    .prefix("Preferred edge partner: ")
+                    .clamp_range(-1i32..=i32::MAX),
+            );
+            match value {
+                i32::MIN..=-1 => *preferred_edge = None,
+                val => *preferred_edge = Some(val as u32),
+            }
+            ui.text_edit_singleline(path);
+            ui.vertical_centered_justified(|ui| {
+                if ui.button("Load").clicked() {
+                    deserialize_graph(graph, &path);
+                }
+                if ui.button("Serialize").clicked() {
+                    serialize_graph(graph, &path);
+                }
+            });
+        });
+    egui::Window::new("info-panel")
+        .default_size(egui::vec2(0.0, 200.0))
+        .show(&ctx, |ui| {
+            // ui.label("Left click to add node");
+            // ui.label("Right click to remove node");
+            // ui.label("Press R to regenerate a random graph");
+            // ui.label("Press U to trigger a step manually");
+            // ui.add_space(10.0);
             ui.label(format!(
                 "Current step: {}{}",
                 steps,
@@ -87,18 +178,18 @@ fn update(
             ));
             ui.label(format!("Num nodes: {}", graph.node_count()));
             ui.label(format!("Num edges: {}", graph.edge_count()));
-            ui.add(
-                Slider::new(update_speed, 1..=1000)
-                    .prefix("Update delay: ")
-                    .suffix(" ms"),
-            );
-            let mut checked = last_check.is_some();
-            ui.checkbox(&mut checked, "auto-update");
-            match last_check {
-                Some(_) if !checked => *last_check = None,
-                None if checked => *last_check = Some(Instant::now()),
-                _ => (),
-            }
+            ui.horizontal(|ui| {
+                ui.label("Temp Edges: ");
+                ui.color_edit_button_srgb(temp_color);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Radial Edges: ");
+                ui.color_edit_button_srgb(radial_color);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Circular Edges: ");
+                ui.color_edit_button_srgb(circular_color);
+            });
             if !*is_connected {
                 ui.label("UNCONNECTED TOPOLOGY!");
                 ui.label("Press C to connect via random edge");
@@ -125,6 +216,9 @@ fn update(
 }
 
 fn event(app: &App, model: &mut Model, event: WindowEvent) {
+    if model.egui.ctx().wants_keyboard_input() {
+        return;
+    }
     match event {
         WindowEvent::KeyReleased(Key::R) => {
             (model.graph, model.is_connected) = create_graph(model.count_nodes);
@@ -145,7 +239,12 @@ fn event(app: &App, model: &mut Model, event: WindowEvent) {
         }
         WindowEvent::MousePressed(MouseButton::Left) if !model.egui.ctx().wants_pointer_input() => {
             let rect = app.main_window().rect();
-            let connection = model.graph.node_indices().choose(&mut thread_rng());
+            let connection = match model.preferred_edge {
+                Some(it) => {
+                    Some(NodeIndex::new(it as usize)).filter(|&it| model.graph.contains_node(it))
+                }
+                None => model.graph.node_indices().choose(&mut thread_rng()),
+            };
             let idx = model
                 .graph
                 .add_node(Vec2::new(app.mouse.x, app.mouse.y) / Vec2::new(rect.w(), rect.h()));
@@ -220,10 +319,19 @@ fn create_graph(num: usize) -> (Graph, bool) {
     (graph, is_connected)
 }
 
-fn view(app: &App, model: &Model, frame: Frame) {
-    let temp_color: Srgb = Srgb::new(1.0, 0.0, 0.0);
-    let radial_color: Srgb = Srgb::new(1.0, 1.0, 0.0);
-    let circular_color: Srgb = Srgb::new(0.0, 0.0, 1.0);
+fn view(
+    app: &App,
+    model @ Model {
+        temp_color,
+        radial_color,
+        circular_color,
+        ..
+    }: &Model,
+    frame: Frame,
+) {
+    let temp_color = Srgb::new(temp_color[0], temp_color[1], temp_color[2]);
+    let radial_color = Srgb::new(radial_color[0], radial_color[1], radial_color[2]);
+    let circular_color = Srgb::new(circular_color[0], circular_color[1], circular_color[2]);
 
     let draw = app.draw();
     let window = app.main_window();
@@ -265,7 +373,14 @@ fn view(app: &App, model: &Model, frame: Frame) {
     let _ = model.egui.draw_to_frame(&frame);
 }
 
-fn render_graph(draw: &Draw, rect: &Rect, graph: &Graph, temp: Srgb, radial: Srgb, circular: Srgb) {
+fn render_graph(
+    draw: &Draw,
+    rect: &Rect,
+    graph: &Graph,
+    temp: Srgb<u8>,
+    radial: Srgb<u8>,
+    circular: Srgb<u8>,
+) {
     graph.edge_references().for_each(|edge| {
         let source = edge.source();
         let target = edge.target();

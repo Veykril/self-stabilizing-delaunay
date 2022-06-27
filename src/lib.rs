@@ -1,4 +1,3 @@
-#![feature(total_cmp)]
 use std::collections::hash_map::Entry;
 use std::f32::consts::PI;
 use std::iter::once;
@@ -7,6 +6,7 @@ use std::ops::Sub;
 use glam::Vec2;
 use itertools::Itertools;
 use petgraph::Direction::Outgoing;
+use serde::{Deserialize, Serialize};
 use spade::{DelaunayTriangulation, HasPosition, Triangulation};
 
 // fx hash for stable hashing
@@ -20,12 +20,25 @@ pub type LDNodeIndex = petgraph::graph::NodeIndex<u16>;
 
 type EdgeSet = HashMap<(NodeIndex, NodeIndex), EdgeKind>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EdgeKind {
     Radial,
     Circular,
     Temp,
 }
+/*
+First up, the problem
+then show a quick sample run where the algo constructs a graph from a random one
+then show a quick sample of a placement/topo change
+
+then we should show the algo in proper
+
+- whats a delaunay graph
+        - a few properties of it maybe
+how does it work in more detail
+
+
+*/
 
 /// Advance the graph by one delaunay update step.
 pub fn delaunay_update(g: &mut Graph) {

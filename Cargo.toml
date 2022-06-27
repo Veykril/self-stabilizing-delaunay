@@ -12,7 +12,10 @@ glam = "0.17.3"
 # stable hashing
 rustc-hash = "1.1.0"
 # graph datastructures
-petgraph = "0.6.0"
+petgraph = { version = "0.6.0", features = ["serde-1"] }
+serde_derive = "1.0.137"
+serde = "1.0.137"
+serde_json = "1.0.81"
 # delaunay triangulation
 spade = "2.0.0"
 
