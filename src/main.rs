@@ -10,6 +10,7 @@ use nannou::prelude::{
 };
 use nannou::rand::prelude::{IteratorRandom, SliceRandom};
 use nannou::rand::thread_rng;
+use nannou::LoopMode;
 use nannou_egui::egui::{DragValue, Slider};
 use nannou_egui::{egui, Egui};
 use petgraph::visit::{EdgeRef, IntoEdgeReferences, IntoNodeReferences};
@@ -39,7 +40,7 @@ fn main() {
             egui: Egui::from_window(&window),
             graph,
             steps: 0,
-            last_check: Some(Instant::now()),
+            last_check: None,
             is_connected: true,
             update_speed: 500,
             count_nodes: 50,
@@ -51,6 +52,7 @@ fn main() {
             circular_color: [0, 0, 255],
         }
     })
+    .loop_mode(LoopMode::RefreshSync)
     .update(update)
     .run();
 }
@@ -125,6 +127,25 @@ fn update(
 ) {
     egui.set_elapsed_time(update.since_start);
     let ctx = egui.begin_frame();
+    egui::Window::new("graphs").show(&ctx, |ui| {
+        if let Ok(dir) = std::fs::read_dir("./graphs") {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                dir.for_each(|dir| {
+                    if let Ok(dir) = dir {
+                        if ui.button(dir.path().display()).clicked() {
+                            deserialize_graph(graph, dir.path());
+                        }
+                    }
+                });
+            });
+        }
+        ui.vertical_centered_justified(|ui| {
+            ui.text_edit_singleline(path);
+            if ui.button("Serialize").clicked() {
+                serialize_graph(graph, &path);
+            }
+        });
+    });
     egui::Window::new("tools")
         .default_size(egui::vec2(0.0, 200.0))
         .show(&ctx, |ui| {
@@ -153,15 +174,6 @@ fn update(
                 i32::MIN..=-1 => *preferred_edge = None,
                 val => *preferred_edge = Some(val as u32),
             }
-            ui.text_edit_singleline(path);
-            ui.vertical_centered_justified(|ui| {
-                if ui.button("Load").clicked() {
-                    deserialize_graph(graph, &path);
-                }
-                if ui.button("Serialize").clicked() {
-                    serialize_graph(graph, &path);
-                }
-            });
         });
     egui::Window::new("info-panel")
         .default_size(egui::vec2(0.0, 200.0))
@@ -408,6 +420,7 @@ fn render_graph(
         draw.ellipse().xy(pos).w_h(10.0, 10.0).color(radial);
         draw.text(&format!("{}", node.index()))
             .xy(pos + Vec2::new(0.0, 20.0))
+            .font_size(16)
             .w_h(10.0, 10.0);
     });
 }
